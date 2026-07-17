@@ -88,6 +88,10 @@ OpenAI y Anthropic tienen formatos distintos para instrucciones, mensajes,
 respuestas y streaming. Cada adaptador traduce esos formatos al mismo contrato
 de `ModelResponse`, `ErrorResponse` y `StreamEvent`.
 
+La implementación de OpenAI usa Responses API porque es la API principal para
+generación de texto en el SDK oficial actual. Conserva la misma asincronía y el
+mismo streaming requeridos por la consigna.
+
 ## Errores controlados
 
 Los SDKs reintentan automáticamente según `LLM_MAX_RETRIES`. Si el problema
@@ -112,6 +116,22 @@ ruff check .
 ruff format --check .
 pyright
 ```
+
+GitHub Actions ejecuta estas mismas verificaciones automáticamente en cada push
+y pull request, sin acceder a credenciales de proveedores.
+
+### Validación contra APIs reales
+
+La prueba de integración real está desactivada por defecto para evitar consumo
+accidental. Requiere ambas claves en el `.env` local y realiza cuatro solicitudes
+breves: generación normal y streaming para OpenAI y Anthropic.
+
+```bash
+RUN_LIVE_LLM_TESTS=1 pytest -m live -q
+```
+
+Las pruebas limitan cada respuesta a 64 tokens. Nunca deben agregarse las claves
+al repositorio ni configurarse como secretos del workflow para esta entrega.
 
 ## Seguridad
 

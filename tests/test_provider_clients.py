@@ -179,6 +179,31 @@ async def test_openai_returns_controlled_rate_limit_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openai_returns_controlled_authentication_error() -> None:
+    config = LLMConfig(
+        provider=Provider.OPENAI,
+        openai_api_key=SecretStr("test-key"),
+    )
+    fake = FakeOpenAI()
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx.Response(401, request=request)
+    fake.responses.error = openai.AuthenticationError(
+        "invalid key",
+        response=response,
+        body=None,
+    )
+    client = OpenAIClient(config, client=cast(AsyncOpenAI, fake))
+
+    result = await client.generate(messages())
+
+    assert isinstance(result, ErrorResponse)
+    assert result.error_type is ErrorType.API
+    assert result.retryable is False
+    assert result.message == "OpenAI returned HTTP 401"
+    assert "test-key" not in result.message
+
+
+@pytest.mark.asyncio
 async def test_anthropic_normalizes_generate_and_stream_responses() -> None:
     config = LLMConfig(
         provider=Provider.ANTHROPIC,
@@ -288,4 +313,29 @@ async def test_anthropic_generate_returns_controlled_rate_limit_error() -> None:
     assert isinstance(result, ErrorResponse)
     assert result.error_type is ErrorType.RATE_LIMIT
     assert result.retryable is True
+    assert "test-key" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_anthropic_returns_controlled_authentication_error() -> None:
+    config = LLMConfig(
+        provider=Provider.ANTHROPIC,
+        anthropic_api_key=SecretStr("test-key"),
+    )
+    fake = FakeAnthropic()
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx.Response(401, request=request)
+    fake.messages.error = anthropic.AuthenticationError(
+        "invalid key",
+        response=response,
+        body=None,
+    )
+    client = AnthropicClient(config, client=cast(AsyncAnthropic, fake))
+
+    result = await client.generate(messages())
+
+    assert isinstance(result, ErrorResponse)
+    assert result.error_type is ErrorType.API
+    assert result.retryable is False
+    assert result.message == "Anthropic returned HTTP 401"
     assert "test-key" not in result.message

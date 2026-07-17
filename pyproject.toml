@@ -33,6 +33,9 @@ include = ["clients*"]
 asyncio_mode = "auto"
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "live: calls real provider APIs and consumes credits",
+]
 
 [tool.pyright]
 include = ["clients", "tests", "main.py", "manager.py", "schemas.py"]
