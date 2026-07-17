@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "unified-async-llm-client"
+version = "1.0.0"
+description = "Unified asynchronous client for OpenAI and Anthropic"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Thiago Serratto" }]
+dependencies = [
+    "anthropic>=0.117.0,<1",
+    "openai>=2.45.0,<3",
+    "pydantic>=2.13.4,<3",
+    "python-dotenv>=1.1.1,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyright>=1.1.406,<2",
+    "pytest>=8.4.2,<9",
+    "pytest-asyncio>=1.2.0,<2",
+    "ruff>=0.12.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["clients"]
+include = ["manager.py", "schemas.py"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+include = ["clients", "main.py", "manager.py", "schemas.py", "tests"]
