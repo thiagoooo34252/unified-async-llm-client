@@ -1,66 +1,59 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 
 import pytest
+from pydantic import SecretStr
 
 from clients.base import BaseLLMClient
 from manager import AsyncLLMManager
 from schemas import (
-    GenerationRequest,
-    GenerationResponse,
+    ChatMessage,
     GenerationResult,
+    LLMConfig,
+    MessageRole,
+    ModelResponse,
     Provider,
     StreamEvent,
-    StreamEventType,
 )
 
 
 class FakeClient(BaseLLMClient):
-    def __init__(self) -> None:
+    def __init__(self, config: LLMConfig) -> None:
+        super().__init__(config)
         self.closed = False
 
-    async def generate(self, request: GenerationRequest) -> GenerationResult:
-        return GenerationResponse(
-            provider=Provider.OPENAI,
-            model="fake-model",
-            text=request.prompt,
+    async def generate(self, messages: Sequence[ChatMessage]) -> GenerationResult:
+        return ModelResponse(
+            provider=self.config.provider,
+            model=self.config.model,
+            content=messages[-1].content,
         )
 
-    async def stream(self, request: GenerationRequest) -> AsyncIterator[StreamEvent]:
-        yield StreamEvent(
-            provider=Provider.OPENAI,
-            model="fake-model",
-            type=StreamEventType.DELTA,
-            delta=request.prompt,
-        )
+    async def stream(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(content=messages[-1].content)
+        yield StreamEvent(done=True)
 
     async def close(self) -> None:
         self.closed = True
 
 
-def test_manager_requires_at_least_one_client() -> None:
-    with pytest.raises(ValueError, match="At least one"):
-        AsyncLLMManager({})
-
-
 @pytest.mark.asyncio
-async def test_manager_routes_and_closes_clients() -> None:
-    client = FakeClient()
-    manager = AsyncLLMManager({Provider.OPENAI: client})
-    request = GenerationRequest(prompt="Hello")
+async def test_manager_exposes_common_generate_and_stream_contract() -> None:
+    config = LLMConfig(
+        provider=Provider.OPENAI,
+        openai_api_key=SecretStr("test-key"),
+    )
+    fake = FakeClient(config)
+    messages = [ChatMessage(role=MessageRole.USER, content="hello")]
 
-    response = await manager.generate(Provider.OPENAI, request)
-    assert response.ok is True
-    assert response.text == "Hello"
+    async with AsyncLLMManager(config, client=fake) as manager:
+        response = await manager.generate(messages)
+        events = [event async for event in manager.stream(messages)]
 
-    events = [event async for event in manager.stream(Provider.OPENAI, request)]
-    assert events[0].delta == "Hello"
-
-    await manager.close()
-    assert client.closed is True
-
-
-def test_manager_rejects_unconfigured_provider() -> None:
-    manager = AsyncLLMManager({Provider.OPENAI: FakeClient()})
-
-    with pytest.raises(ValueError, match="not configured"):
-        manager.stream(Provider.ANTHROPIC, GenerationRequest(prompt="Hello"))
+    assert isinstance(response, ModelResponse)
+    assert response.content == "hello"
+    assert [event.content for event in events] == ["hello", None]
+    assert events[-1].done is True
+    assert fake.closed is True

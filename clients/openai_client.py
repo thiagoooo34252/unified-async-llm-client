@@ -1,214 +1,170 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from typing import cast
 
 import openai
 from openai import AsyncOpenAI
+from openai.types.responses import ResponseInputParam
 
 from clients.base import BaseLLMClient
 from schemas import (
-    ErrorCode,
+    ChatMessage,
     ErrorResponse,
-    GenerationRequest,
-    GenerationResponse,
+    ErrorType,
     GenerationResult,
-    Provider,
+    LLMConfig,
+    MessageRole,
+    ModelResponse,
     StreamEvent,
-    StreamEventType,
 )
 
 
 class OpenAIClient(BaseLLMClient):
-    """OpenAI implementation backed by the asynchronous Responses API."""
-
     def __init__(
         self,
-        *,
-        api_key: str | None = None,
-        default_model: str = "gpt-5.6-luna",
-        timeout: float = 60.0,
-        max_retries: int = 2,
+        config: LLMConfig,
         client: AsyncOpenAI | None = None,
     ) -> None:
-        self._default_model = default_model
+        super().__init__(config)
         self._client = client or AsyncOpenAI(
-            api_key=api_key,
-            timeout=timeout,
-            max_retries=max_retries,
+            api_key=config.api_key.get_secret_value(),
+            max_retries=config.max_retries,
+            timeout=config.timeout_seconds,
         )
 
-    async def generate(self, request: GenerationRequest) -> GenerationResult:
-        model = request.model or self._default_model
+    async def generate(self, messages: Sequence[ChatMessage]) -> GenerationResult:
+        instructions, input_messages = self._normalize_messages(messages)
         try:
             response = await self._client.responses.create(
-                model=model,
-                input=request.prompt,
-                instructions=request.system_prompt,
-                max_output_tokens=request.max_tokens,
-                temperature=request.temperature,
-            )
-            text = response.output_text.strip()
-            if not text:
-                return self._empty_response(model)
-
-            return GenerationResponse(
-                provider=Provider.OPENAI,
-                model=response.model or model,
-                text=text,
-                input_tokens=response.usage.input_tokens if response.usage else None,
-                output_tokens=response.usage.output_tokens if response.usage else None,
-            )
-        except openai.AuthenticationError:
-            return self._error(
-                ErrorCode.AUTHENTICATION,
-                "OpenAI rejected the configured API key.",
-                retryable=False,
+                model=self.config.model,
+                instructions=instructions or None,
+                input=input_messages,
+                temperature=self.config.temperature,
+                max_output_tokens=self.config.max_tokens,
             )
         except openai.RateLimitError:
-            return self._error(
-                ErrorCode.RATE_LIMIT,
-                "OpenAI rate limit reached. Try again later.",
+            return self.error(
+                ErrorType.RATE_LIMIT,
+                "OpenAI rate limit reached after retries",
                 retryable=True,
             )
         except openai.APITimeoutError:
-            return self._error(
-                ErrorCode.TIMEOUT,
-                "OpenAI did not respond before the timeout.",
+            return self.error(
+                ErrorType.TIMEOUT,
+                "OpenAI request timed out after retries",
                 retryable=True,
             )
         except openai.APIConnectionError:
-            return self._error(
-                ErrorCode.CONNECTION,
-                "Could not connect to OpenAI.",
+            return self.error(
+                ErrorType.CONNECTION,
+                "OpenAI could not be reached after retries",
                 retryable=True,
             )
         except openai.APIStatusError as exc:
-            return self._error(
-                ErrorCode.PROVIDER,
-                f"OpenAI returned HTTP {exc.status_code}.",
-                retryable=exc.status_code >= 500,
-            )
-        except ValueError as exc:
-            return self._error(
-                ErrorCode.CONFIGURATION,
-                str(exc),
+            return self._status_error(exc)
+
+        content = response.output_text.strip()
+        if not content:
+            return self.error(
+                ErrorType.EMPTY_RESPONSE,
+                "OpenAI returned no text content",
                 retryable=False,
             )
+        usage = response.usage
+        return ModelResponse(
+            provider=self.config.provider,
+            model=self.config.model,
+            content=content,
+            input_tokens=usage.input_tokens if usage else None,
+            output_tokens=usage.output_tokens if usage else None,
+        )
 
-    async def stream(self, request: GenerationRequest) -> AsyncIterator[StreamEvent]:
-        model = request.model or self._default_model
-        emitted_text = False
+    async def stream(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> AsyncIterator[StreamEvent]:
+        instructions, input_messages = self._normalize_messages(messages)
+        emitted_content = False
         try:
-            stream = await self._client.responses.create(
-                model=model,
-                input=request.prompt,
-                instructions=request.system_prompt,
-                max_output_tokens=request.max_tokens,
-                temperature=request.temperature,
+            async with await self._client.responses.create(
+                model=self.config.model,
+                instructions=instructions or None,
+                input=input_messages,
+                temperature=self.config.temperature,
+                max_output_tokens=self.config.max_tokens,
                 stream=True,
-            )
-            async for event in stream:
-                if event.type == "response.output_text.delta":
-                    emitted_text = emitted_text or bool(event.delta)
-                    yield StreamEvent(
-                        provider=Provider.OPENAI,
-                        model=model,
-                        type=StreamEventType.DELTA,
-                        delta=event.delta,
-                    )
-                elif event.type == "response.completed":
-                    completed_model = event.response.model or model
-                    if not emitted_text:
-                        yield StreamEvent(
-                            provider=Provider.OPENAI,
-                            model=completed_model,
-                            type=StreamEventType.ERROR,
-                            error=self._empty_response(completed_model),
-                        )
-                        return
-                    yield StreamEvent(
-                        provider=Provider.OPENAI,
-                        model=completed_model,
-                        type=StreamEventType.COMPLETED,
-                    )
-        except openai.AuthenticationError:
-            yield self._stream_error(
-                model,
-                ErrorCode.AUTHENTICATION,
-                "OpenAI rejected the configured API key.",
-                retryable=False,
-            )
+            ) as stream:
+                async for event in stream:
+                    if event.type == "response.output_text.delta" and event.delta:
+                        emitted_content = True
+                        yield StreamEvent(content=event.delta)
         except openai.RateLimitError:
-            yield self._stream_error(
-                model,
-                ErrorCode.RATE_LIMIT,
-                "OpenAI rate limit reached. Try again later.",
-                retryable=True,
+            yield StreamEvent(
+                error=self.error(
+                    ErrorType.RATE_LIMIT,
+                    "OpenAI rate limit reached during streaming",
+                    retryable=True,
+                )
             )
+            return
         except openai.APITimeoutError:
-            yield self._stream_error(
-                model,
-                ErrorCode.TIMEOUT,
-                "OpenAI did not respond before the timeout.",
-                retryable=True,
+            yield StreamEvent(
+                error=self.error(
+                    ErrorType.TIMEOUT,
+                    "OpenAI streaming request timed out",
+                    retryable=True,
+                )
             )
+            return
         except openai.APIConnectionError:
-            yield self._stream_error(
-                model,
-                ErrorCode.CONNECTION,
-                "Could not connect to OpenAI.",
-                retryable=True,
+            yield StreamEvent(
+                error=self.error(
+                    ErrorType.CONNECTION,
+                    "OpenAI streaming connection failed",
+                    retryable=True,
+                )
             )
+            return
         except openai.APIStatusError as exc:
-            yield self._stream_error(
-                model,
-                ErrorCode.PROVIDER,
-                f"OpenAI returned HTTP {exc.status_code}.",
-                retryable=exc.status_code >= 500,
+            yield StreamEvent(error=self._status_error(exc))
+            return
+        if not emitted_content:
+            yield StreamEvent(
+                error=self.error(
+                    ErrorType.EMPTY_RESPONSE,
+                    "OpenAI stream returned no text content",
+                    retryable=False,
+                )
             )
-        except ValueError as exc:
-            yield self._stream_error(
-                model,
-                ErrorCode.CONFIGURATION,
-                str(exc),
-                retryable=False,
-            )
+            return
+        yield StreamEvent(done=True)
 
     async def close(self) -> None:
         await self._client.close()
 
-    @staticmethod
-    def _error(
-        code: ErrorCode,
-        message: str,
-        *,
-        retryable: bool,
-    ) -> ErrorResponse:
-        return ErrorResponse(
-            provider=Provider.OPENAI,
-            code=code,
-            message=message,
+    def _normalize_messages(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> tuple[str, ResponseInputParam]:
+        validated = self.validate_messages(messages)
+        instructions = "\n\n".join(
+            message.content
+            for message in validated
+            if message.role is MessageRole.SYSTEM
+        )
+        input_messages = cast(
+            ResponseInputParam,
+            [
+                {"role": message.role.value, "content": message.content}
+                for message in validated
+                if message.role is not MessageRole.SYSTEM
+            ],
+        )
+        return instructions, input_messages
+
+    def _status_error(self, error: openai.APIStatusError) -> ErrorResponse:
+        retryable = error.status_code >= 500
+        return self.error(
+            ErrorType.API,
+            f"OpenAI returned HTTP {error.status_code}",
             retryable=retryable,
-        )
-
-    @classmethod
-    def _empty_response(cls, model: str) -> ErrorResponse:
-        return cls._error(
-            ErrorCode.EMPTY_RESPONSE,
-            f"OpenAI returned an empty response for model {model}.",
-            retryable=True,
-        )
-
-    @classmethod
-    def _stream_error(
-        cls,
-        model: str,
-        code: ErrorCode,
-        message: str,
-        *,
-        retryable: bool,
-    ) -> StreamEvent:
-        return StreamEvent(
-            provider=Provider.OPENAI,
-            model=model,
-            type=StreamEventType.ERROR,
-            error=cls._error(code, message, retryable=retryable),
         )

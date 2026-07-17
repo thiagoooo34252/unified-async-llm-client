@@ -1,7 +1,16 @@
 from enum import StrEnum
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    StringConstraints,
+    model_validator,
+)
+
+NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class Provider(StrEnum):
@@ -9,84 +18,115 @@ class Provider(StrEnum):
     ANTHROPIC = "anthropic"
 
 
-class ErrorCode(StrEnum):
-    AUTHENTICATION = "authentication_error"
-    RATE_LIMIT = "rate_limit_error"
-    TIMEOUT = "timeout_error"
-    CONNECTION = "connection_error"
-    PROVIDER = "provider_error"
+class MessageRole(StrEnum):
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+class ErrorType(StrEnum):
+    RATE_LIMIT = "rate_limit"
+    TIMEOUT = "timeout"
+    CONNECTION = "connection"
+    API = "api"
     EMPTY_RESPONSE = "empty_response"
-    CONFIGURATION = "configuration_error"
 
 
-class StreamEventType(StrEnum):
-    DELTA = "delta"
-    COMPLETED = "completed"
-    ERROR = "error"
-
-
-class GenerationRequest(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    prompt: Annotated[str, Field(min_length=1, max_length=100_000)]
-    model: Annotated[str | None, Field(min_length=1)] = None
-    system_prompt: Annotated[str | None, Field(min_length=1, max_length=20_000)] = None
-    max_tokens: Annotated[int, Field(ge=1, le=32_000)] = 1024
-    temperature: Annotated[float, Field(ge=0, le=1)] = 0.2
-
-
-class GenerationResponse(BaseModel):
+class ChatMessage(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    ok: Literal[True] = True
-    provider: Provider
-    model: str
-    text: str
-    input_tokens: int | None = None
-    output_tokens: int | None = None
+    role: MessageRole
+    content: NonEmptyText
 
-    @computed_field
+
+class ChatRequest(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    messages: list[ChatMessage] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_user_message(self) -> Self:
+        if not any(message.role is MessageRole.USER for message in self.messages):
+            raise ValueError("At least one user message is required")
+        return self
+
+
+class LLMConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    provider: Provider
+    openai_api_key: SecretStr | None = None
+    anthropic_api_key: SecretStr | None = None
+    openai_model: NonEmptyText = "gpt-5.6-luna"
+    anthropic_model: NonEmptyText = "claude-sonnet-5"
+    temperature: float = Field(default=0.2, ge=0, le=2)
+    max_tokens: int = Field(default=1024, ge=1, le=16384)
+    timeout_seconds: float = Field(default=60, gt=0, le=300)
+    max_retries: int = Field(default=2, ge=0, le=5)
+
+    @model_validator(mode="after")
+    def require_provider_api_key(self) -> Self:
+        if not self.api_key.get_secret_value().strip():
+            raise ValueError(f"The {self.provider.value} API key cannot be blank")
+        return self
+
     @property
-    def total_tokens(self) -> int | None:
-        if self.input_tokens is None or self.output_tokens is None:
-            return None
-        return self.input_tokens + self.output_tokens
+    def api_key(self) -> SecretStr:
+        key = (
+            self.openai_api_key
+            if self.provider is Provider.OPENAI
+            else self.anthropic_api_key
+        )
+        if key is None:
+            raise ValueError(f"The {self.provider.value} API key is not configured")
+        return key
+
+    @property
+    def model(self) -> str:
+        if self.provider is Provider.OPENAI:
+            return self.openai_model
+        return self.anthropic_model
+
+
+class ModelResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    provider: Provider
+    model: NonEmptyText
+    content: NonEmptyText
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
 
 
 class ErrorResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    ok: Literal[False] = False
     provider: Provider
-    code: ErrorCode
-    message: str
-    retryable: bool = False
-
-
-GenerationResult: TypeAlias = GenerationResponse | ErrorResponse
+    model: NonEmptyText
+    error_type: ErrorType
+    message: NonEmptyText
+    retryable: bool
 
 
 class StreamEvent(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    provider: Provider
-    model: str
-    type: StreamEventType
-    delta: str | None = None
+    content: str | None = None
     error: ErrorResponse | None = None
+    done: bool = False
 
     @model_validator(mode="after")
-    def validate_payload(self) -> "StreamEvent":
-        if self.type is StreamEventType.DELTA:
-            if self.delta is None:
-                raise ValueError("Delta events require text.")
-            if self.error is not None:
-                raise ValueError("Delta events cannot include an error.")
-        elif self.type is StreamEventType.ERROR:
-            if self.error is None:
-                raise ValueError("Error events require an error payload.")
-            if self.delta is not None:
-                raise ValueError("Error events cannot include text.")
-        elif self.delta is not None or self.error is not None:
-            raise ValueError("Completed events cannot include a payload.")
+    def validate_event(self) -> Self:
+        populated = sum(
+            (
+                bool(self.content),
+                self.error is not None,
+                self.done,
+            )
+        )
+        if populated != 1:
+            raise ValueError("A stream event must contain content, an error, or done")
         return self
+
+
+GenerationResult = ModelResponse | ErrorResponse
